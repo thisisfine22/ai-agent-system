@@ -1,155 +1,186 @@
-# Realestoria Valuation Pipeline
+# Autonomous AI Agent Infrastructure
+
+A production-grade multi-agent system built on a Mac Mini home server — designed to run a real e-commerce business autonomously with human-in-the-loop approval gates.
+
+## Overview
+
+This system replaces the operational overhead of running a Shopify-based e-commerce brand by deploying a hierarchy of specialized AI agents that handle email marketing, content creation, SEO, and customer workflows — all requiring explicit human approval before execution.
+
+**Stack:** Python 3.12 · Claude claude-opus-4-6/Sonnet · PostgreSQL 16 · Telegram Bot API · Anthropic Tool Use · asyncpg · aiohttp · launchd
+
+---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        USER FLOW                                │
-│                                                                 │
-│  Website Form  ──►  valuation_requests  ──►  Prediction Engine  │
-│       │                                          │              │
-│       └──►  valuation_leads  ──►  HubSpot CRM    │              │
-│                                                  ▼              │
-│                                     valuation_predictions       │
-│                                        (+ 3 comps)             │
-│                                          │                      │
-│                                          ▼                      │
-│                                    Dashboard / API              │
-└─────────────────────────────────────────────────────────────────┘
-
-┌─────────────────────────────────────────────────────────────────┐
-│                     MODEL TRAINING                              │
-│                                                                 │
-│  mls_sold_only_raw  ──►  mls_sold_only_clean  ──►  XGBoost     │
-│   (MLSPin CSV)            (BigQuery VIEW)        train_model.py │
-│                                                      │          │
-│                                                      ▼          │
-│                                              model_artifacts/   │
-│                                              ├─ model.json      │
-│                                              ├─ encoders.pkl    │
-│                                              ├─ metrics.json    │
-│                                              ├─ zip_lookup.json │
-│                                              └─ feature_cols.json│
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                     PERSONAL DEVICE                         │
+│                  Telegram (iOS/Android)                     │
+│              Human approval: Y / N only                     │
+└──────────────────────────┬──────────────────────────────────┘
+                           │ Telegram Bot API (outbound only)
+┌──────────────────────────▼──────────────────────────────────┐
+│                      MAC MINI SERVER                        │
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │                   bot.py (async)                    │   │
+│  │         python-telegram-bot 20.x · polling          │   │
+│  │                                                     │   │
+│  │  ┌──────────────┐    ┌────────────────────────┐    │   │
+│  │  │ Auth layer   │    │  Y/N approval handler  │    │   │
+│  │  │ user_id gate │    │  writes to PostgreSQL   │    │   │
+│  │  └──────────────┘    └────────────────────────┘    │   │
+│  └──────────────────────────┬────────────────────────┘   │
+│                             │                             │
+│  ┌──────────────────────────▼────────────────────────┐   │
+│  │              CTO Agent (Claude claude-opus-4-6)         │   │
+│  │                                                   │   │
+│  │  Tools:  read_context · create_task               │   │
+│  │          send_proposal · check_tasks              │   │
+│  │                                                   │   │
+│  │  Model strategy:                                  │   │
+│  │    Round 0    → claude-opus-4-6 (strategic)            │   │
+│  │    Rounds 1-N → claude-sonnet-4-6 (tool execution)     │   │
+│  │    429 error  → gpt-4o-mini (fallback)            │   │
+│  │                                                   │   │
+│  │  Rolling 20-message window                        │   │
+│  │  Max 12 tool rounds per request                   │   │
+│  └──────────────────────────┬────────────────────────┘   │
+│                             │                             │
+│  ┌──────────────────────────▼────────────────────────┐   │
+│  │           PostgreSQL 16 (agents schema)           │   │
+│  │                                                   │   │
+│  │  agents.memory       — rolling fact store         │   │
+│  │  agents.tasks        — proposed → approved →      │   │
+│  │                         in_progress → done        │   │
+│  │  agents.proposals    — pending Y/N approvals      │   │
+│  │  agents.task_context — agent working memory       │   │
+│  │  agents.audit_log    — full action history        │   │
+│  └──────────────────────────┬────────────────────────┘   │
+│                             │                             │
+│  ┌──────────────────────────▼────────────────────────┐   │
+│  │              Task Runner (polling 60s)            │   │
+│  │                                                   │   │
+│  │  Picks up status='approved' tasks only            │   │
+│  │  Routes to worker agents by assigned_to field     │   │
+│  └──────┬──────────────┬──────────────┬─────────────┘   │
+│         │              │              │                   │
+│  ┌──────▼───┐  ┌───────▼──┐  ┌───────▼──┐              │
+│  │marketing │  │ecommerce │  │ customer │              │
+│  │  agent   │  │  agent   │  │  agent   │              │
+│  │(Sonnet)  │  │(Sonnet)  │  │(Sonnet)  │              │
+│  └──────────┘  └──────────┘  └──────────┘              │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │         Watchdog (launchd, every 60s)           │   │
+│  │   Monitors bot.py + task_runner.py              │   │
+│  │   Alerts owner via Telegram if anything fails   │   │
+│  └─────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## BigQuery Tables
+---
 
-| Table | Purpose | Source |
+## Key Design Decisions
+
+### 1. Human-in-the-loop is non-negotiable
+Every task proposal requires explicit `Y` approval before it touches any external system. The approval handler writes directly to PostgreSQL — it cannot be bypassed by the agent. Worker agents only see tasks with `status='approved'`.
+
+### 2. Model tiering for cost efficiency
+- **Claude claude-opus-4-6** handles the first reasoning round (strategic thinking, context reading)
+- **Claude Sonnet** handles subsequent tool execution rounds (cheaper, faster)
+- **GPT-4o-mini** serves as a 429 fallback — never leaves the user without a response
+
+### 3. Tool use over MCP for reliability
+Native Anthropic tool definitions (`read_context`, `create_task`, `send_proposal`, `check_tasks`) instead of stdio MCP servers. MCP requires URL-based servers for the Anthropic API — native tools give full control over execution and error handling.
+
+### 4. Isolated PostgreSQL access
+The `peshtemal` PostgreSQL role has zero access to other databases on the same server. Verified with permission denied checks. The bot uses asyncpg directly for writes (not MCP) to ensure transactional integrity.
+
+### 5. API scope minimization
+- **Klaviyo:** No `write_customers`, no `write_orders` — read-only on customer data
+- **Shopify:** No `write_customers`, no `write_orders` — agent can update products and content only
+- **Telegram:** Single authorized user ID checked on every incoming message
+
+### 6. Memory architecture
+A Haiku-powered fact extractor runs after every conversation turn. It extracts one business-relevant fact and writes it to `agents.memory`. The system prompt for every new request includes the last 20 facts — giving the CTO agent persistent memory without storing full conversation history.
+
+---
+
+## Task Lifecycle
+
+```
+User message → CTO Agent reads context files
+             → CTO calls create_task() → PostgreSQL: status='proposed'
+             → CTO calls send_proposal() → PostgreSQL: proposals table
+             → Bot sends proposal to Telegram
+             → User replies Y
+             → Bot writes status='approved' to tasks + proposals
+             → Task Runner polls every 60s
+             → Task Runner picks up approved task
+             → Worker agent executes
+             → Result sent back to Telegram
+```
+
+---
+
+## Security Model
+
+| Layer | Control |
+|---|---|
+| Telegram | Single `user_id` allowlist — all other messages silently dropped |
+| PostgreSQL | Isolated role, no cross-database access, asyncpg direct writes |
+| Shopify API | Scoped to read customers, write products/content only |
+| Klaviyo API | Scoped to flows/templates/lists — no customer data writes |
+| GitHub | Deploy key scoped to single repo, no personal Mac access |
+| Network | PostgreSQL not exposed to network — SSH tunnel only |
+| Secrets | `.env` gitignored, chmod 600, never in version control |
+
+---
+
+## Infrastructure
+
+- **Server:** Mac Mini (Apple Silicon), always-on
+- **Process management:** launchd plists with auto-restart
+- **Networking:** Tailscale for secure remote access
+- **Backups:** rclone to Google Drive (nightly)
+- **Monitoring:** Watchdog bot with Telegram alerts
+- **Deployment:** GitHub SSH deploy key + git pull cron (15 min)
+
+---
+
+## Agent Roster
+
+| Agent | Model | Responsibilities |
 |---|---|---|
-| `mls_sold_only_raw` | Raw MLSPin export (150+ columns) | CSV upload |
-| `mls_sold_only_clean` | **VIEW** — cleaned, feature-engineered, filtered | SQL view on raw |
-| `valuation_requests` | User form submissions (address, beds, baths, sqft) | Website form |
-| `valuation_leads` | Lead info for HubSpot sync (email, name, contact) | Website form |
-| `valuation_predictions` | Model outputs + comps, linked to requests | Prediction service |
-| `sales` | (Existing) | — |
+| CTO | Claude claude-opus-4-6 → Sonnet | Strategy, task creation, proposals |
+| marketing-peshtemal | Claude Sonnet | Instagram/Pinterest content, scheduling |
+| ecommerce | Claude Sonnet | Shopify SEO, product pages, conversion |
+| customer | Claude Sonnet | Klaviyo flows, email sequences, segments |
 
-### Data separation logic:
-- **valuation_leads** → CRM/HubSpot pipeline (lead scoring, follow-up)
-- **valuation_requests** → ML input (what to predict)
-- **valuation_predictions** → ML output (results + comps)
-- **mls_sold_only_clean** → ML training data (what the model learns from)
+---
 
-## Setup Steps
+## What This Replaces
 
-### 1. Create the cleaned MLS view
-Run in BigQuery:
-```sql
--- File: sql/01_mls_sold_only_clean.sql
--- Creates VIEW realestoria.mls_sold_only_clean
-```
+| Manual task | Agent |
+|---|---|
+| Writing Klaviyo email flows | customer agent |
+| Updating Shopify product descriptions | ecommerce agent |
+| Writing Instagram captions and scheduling | marketing agent |
+| Monitoring store performance | ecommerce agent |
+| Building email segments | customer agent |
 
-### 2. Create predictions table
-Run in BigQuery:
-```sql
--- File: sql/02_valuation_predictions.sql
--- Creates TABLE realestoria.valuation_predictions
-```
+---
 
-### 3. Train the model
-```bash
-pip install -r requirements.txt
-export GOOGLE_CLOUD_PROJECT=your-project-id
+## Status
 
-# Train (reads from BigQuery, saves to model_artifacts/)
-python scripts/train_model.py
-```
-
-### 4. Run predictions
-```bash
-# Batch: process all pending requests
-python scripts/predict_service.py
-
-# Test single prediction locally
-python scripts/predict_service.py --test
-```
-
-## Model Details
-
-### Features used (from MLSPin)
-| Feature | Source Column | Type |
-|---|---|---|
-| sqft | SQUARE_FEET / AboveGradeFinishedArea | numeric |
-| beds | NO_BEDROOMS | numeric |
-| total_baths | NO_FULL_BATHS + NO_HALF_BATHS×0.5 | numeric |
-| total_rooms | NO_ROOMS | numeric |
-| lot_acres | ACRE / LOT_SIZE÷43560 | numeric |
-| garage_spaces | GARAGE_SPACES | numeric |
-| parking | TOTAL_PARKING | numeric |
-| year_built | YEAR_BUILT | numeric |
-| age_at_sale | sold_year - year_built | derived |
-| living_levels | NO_LIVING_LEVELS | numeric |
-| basement_sqft | BelowGradeFinishedArea | numeric |
-| has_cooling | COOLING | boolean |
-| has_basement | BASEMENT | boolean |
-| finished_basement | BASEMENT_FEATURE + BelowGradeFinishedArea | boolean |
-| master_bath | MASTER_BATH | boolean |
-| waterfront | WATERFRONT_FLAG | boolean |
-| hoa_fee | HOA_FEE | numeric |
-| tax_assessment | ASSESSMENTS | numeric |
-| zip_code | ZIP_CODE | categorical |
-| prop_type | PROP_TYPE (SF/CC/MF) | categorical |
-| style | STYLE | categorical |
-| construction | CONSTRUCTION | categorical |
-| sold_month | SETTLED_DATE | derived |
-| recency_weight | months_since_sale | derived |
-
-### Fallback strategy
-If XGBoost model isn't available (first deploy, no training data yet),
-the system falls back to `predict.py` — a heuristic model with
-Redfin-sourced $/sqft data for 120+ MA ZIP codes.
-
-### Comparable sales
-Each prediction includes up to 3 recent comps from `mls_sold_only_clean`:
-- Same ZIP code
-- Same property type
-- Similar sqft (±30%)
-- Similar beds (±1)
-- Sold within last 12 months
-- Sorted by most recent first
-
-## Files
-
-```
-valuation-pipeline/
-├── sql/
-│   ├── 01_mls_sold_only_clean.sql    # BigQuery VIEW definition
-│   └── 02_valuation_predictions.sql   # Predictions table DDL
-├── scripts/
-│   ├── train_model.py                 # XGBoost training pipeline
-│   ├── predict_service.py             # Prediction + batch processor
-│   └── predict.py                     # Heuristic fallback (v2.0)
-├── requirements.txt
-└── README.md
-```
-
-## Retraining
-
-Retrain monthly or when new MLS data is loaded:
-```bash
-# 1. Upload new MLS CSV to mls_sold_only_raw
-# 2. The VIEW auto-updates (no action needed)
-# 3. Retrain
-python scripts/train_model.py
-# 4. Deploy new model artifacts
-```
+- ✅ CTO bot live on Telegram
+- ✅ Tool use working (read_context, create_task, send_proposal, check_tasks)
+- ✅ PostgreSQL task queue operational
+- ✅ Memory system (Haiku extractor → rolling fact store)
+- ✅ Y/N approval flow end-to-end
+- ✅ GitHub backup
+- 🔄 Task runner (in progress)
+- 🔄 Worker agents (in progress)
+- 🔄 launchd auto-restart (in progress)
+- 🔄 Watchdog monitoring (in progress)
